@@ -53,14 +53,102 @@ const Message = mongoose.model("Message", messageSchema);
 
 // === 1. Add a new appointment slot ===
 app.post("/appointments/add", async (req, res) => {
-  // Input: doctorName, date
-  const { doctorName, date } = req.body;
+  try {
+    const {
+      doctorName,
+      startDate,
+      endDate,
+      startHour,
+      startMinute = 0,
+      endHour,
+      endMinute = 0,
+      intervalMinutes
+    } = req.body;
 
-  // Save to database as "available"
-  const appointment = new Appointment({ doctorName, date, status: "available" });
-  await appointment.save();
+    //  Basic input validation
+    if (!doctorName || !startDate || startHour === undefined) {
+      return res.status(400).json({ error: "Missing required fields." });
+    }
 
-  res.json({ message: "Appointment added", appointment });
+    const start = new Date(startDate);
+    const end = endDate ? new Date(endDate) : new Date(startDate);
+
+    // Validate date order
+    if (end < start) {
+      return res.status(400).json({ error: "End date must be after start date." });
+    }
+
+    // === Case 1️: Single Appointment ===
+    if (endHour === undefined) {
+      const date = new Date(start);
+      date.setHours(startHour, startMinute, 0, 0);
+
+      const singleSlot = new Appointment({
+        doctorName,
+        date,
+        status: "available"
+      });
+
+      await singleSlot.save();
+      return res.json({
+        message: "Single appointment added successfully.",
+        appointment: singleSlot
+      });
+    }
+
+    // === Case 2️: Appointment Block ===
+    const getDatesInRange = (start, end) => {
+      const dates = [];
+      const current = new Date(start);
+      while (current <= end) {
+        dates.push(new Date(current));
+        current.setDate(current.getDate() + 1);
+      }
+      return dates;
+    };
+
+    const days = getDatesInRange(start, end);
+    const slots = [];
+
+    for (const day of days) {
+      const startTime = new Date(day);
+      startTime.setHours(startHour, startMinute, 0, 0);
+
+      const endTime = new Date(day);
+      endTime.setHours(endHour, endMinute, 0, 0);
+
+      //  Validate time order
+      if (endTime <= startTime) {
+        continue; // skip invalid day
+      }
+
+      const step = intervalMinutes || 60;
+
+      //  Flexible slot generation
+      for (let t = new Date(startTime); t <= endTime; t.setMinutes(t.getMinutes() + step)) {
+        slots.push({
+          doctorName,
+          date: new Date(t),
+          status: "available"
+        });
+      }
+    }
+
+    if (slots.length === 0) {
+      return res.status(400).json({ error: "No valid appointment slots generated. Check your time range." });
+    }
+
+    await Appointment.insertMany(slots);
+    res.json({
+      message: ` ${slots.length} appointment slots added successfully.`,
+      totalAdded: slots.length,
+      doctorName
+    });
+
+  } catch (error) {
+    console.error("Error adding appointment:", error);
+    res.status(500).json({ error: "Failed to add appointment(s)." });
+  }
 });
 
 
@@ -186,6 +274,26 @@ app.post("/appointments/book/:id", async (req, res) => {
     );
   }
 
+  // === Auto-miss detection ===
+  const checkTime = new Date(appointmentTime.getTime() + 10 * 60 * 1000);
+  const cronTime = `${checkTime.getMinutes()} ${checkTime.getHours()} ${checkTime.getDate()} ${checkTime.getMonth() + 1} *`;
+
+  cron.schedule(
+    cronTime,
+    async () => {
+      const current = await Appointment.findById(appointment._id);
+      if (!current) return;
+
+      if (current.status === "booked") {
+        const result = await updateAppointmentStatus(current._id, "missed");
+        if (result) {
+          console.log(`⚠️ Auto-marked as missed & updated stats → ${result.user.userName} (${result.user.category})`);
+        }
+      }
+    },
+    { timezone: "Asia/Riyadh" }
+  );
+
   // --- Step 4: Save reminders to appointment record ---
   appointment.reminders = reminders;
   await appointment.save();
@@ -212,47 +320,21 @@ app.post("/appointments/book/:id", async (req, res) => {
 app.post("/appointments/status/:id", async (req, res) => {
   const { status } = req.body;
 
-  const appointment = await Appointment.findByIdAndUpdate(
-    req.params.id,
-    { status },
-    { new: true }
-  );
-
-  const user = await User.findOne({ userName: appointment.userName });
-  if (!user) return res.status(404).json({ message: "User not found" });
-
-  // update reward points
-  if (status === "attended") {
-    user.score += 10;
-    user.attendedCount += 1;
-  } else if (status === "missed") {
-    user.score = Math.max(0, user.score - 5);
-    user.missedCount += 1;
+  const result = await updateAppointmentStatus(req.params.id, status);
+  if (!result) {
+    return res.status(404).json({ message: "Appointment or user not found" });
   }
-
-  // calculate attendance percentage
-  const total = user.attendedCount + user.missedCount;
-  user.attendanceRate = total > 0 ? (user.attendedCount / total) * 100 : 0;
-
-  // classify only if user has 3+ appointments
-  if (total >= 3) {
-    if (user.attendanceRate >= 80) user.category = "Very Good";
-    else if (user.attendanceRate >= 60) user.category = "Good";
-    else user.category = "At-Risk";
-  }
-
-  await user.save();
 
   res.json({
     message: `✅ Appointment marked as ${status}`,
-    appointment,
-    user
+    appointment: result.appointment,
+    user: result.user
   });
 });
 
 
 
-// === Get user performance summary ===
+// === 5. Get user performance summary ===
 // Supports two views: ?view=admin or default (user)
 app.get("/users/:userName", async (req, res) => {
   const user = await User.findOne({ userName: req.params.userName });
@@ -277,6 +359,46 @@ app.get("/users/:userName", async (req, res) => {
     score: user.score
   });
 });
+
+// === Helper: Update appointment and user status ===
+async function updateAppointmentStatus(appointmentId, status) {
+  const appointment = await Appointment.findByIdAndUpdate(
+    appointmentId,
+    { status },
+    { new: true }
+  );
+
+  if (!appointment) return null;
+
+  const user = await User.findOne({ userName: appointment.userName });
+  if (!user) return null;
+
+  // Update reward points and counts
+  if (status === "attended") {
+    user.score += 10;
+    user.attendedCount += 1;
+  } else if (status === "missed") {
+    user.score = Math.max(0, user.score - 5);
+    user.missedCount += 1;
+  }
+
+  // Calculate attendance %
+  const total = user.attendedCount + user.missedCount;
+  user.attendanceRate = total > 0 ? (user.attendedCount / total) * 100 : 0;
+
+  // Reclassify if user has enough history
+  if (total >= 3) {
+    if (user.attendanceRate >= 80) user.category = "Very Good";
+    else if (user.attendanceRate >= 60) user.category = "Good";
+    else user.category = "At-Risk";
+  }
+
+  await user.save();
+
+  return { appointment, user };
+}
+
+
 
 
 // === Start the Server ===

@@ -3,18 +3,51 @@ const API = "http://localhost:3000";
 // === Add Appointment ===
 document.getElementById("addForm").addEventListener("submit", async (e) => {
   e.preventDefault();
+
   const doctorName = document.getElementById("doctorName").value;
-  const date = document.getElementById("date").value;
+  const startDate = document.getElementById("startDate").value;
+  const endDate = document.getElementById("endDate").value;
+  const startTime = document.getElementById("startTime").value;
+  const endTime = document.getElementById("endTime").value;
+  const intervalMinutes = document.getElementById("intervalMinutes").value
+    ? parseInt(document.getElementById("intervalMinutes").value)
+    : undefined;
+
+  if (!startTime) {
+    alert("Please select a start time.");
+    return;
+  }
+
+  // Extract hour & minute parts
+  const [startHour, startMinute] = startTime.split(":").map(Number);
+  const [endHour, endMinute] = endTime ? endTime.split(":").map(Number) : [undefined, undefined];
 
   const res = await fetch(`${API}/appointments/add`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ doctorName, date })
+    body: JSON.stringify({
+      doctorName,
+      startDate,
+      endDate,
+      startHour,
+      startMinute,
+      endHour,
+      endMinute,
+      intervalMinutes
+    })
   });
+
   const data = await res.json();
-  alert(data.message);
+  if (!res.ok) {
+    // Server returned an error (e.g., invalid time range)
+    alert("❌ " + (data.error || "Failed to add appointment"));
+  } else {
+    alert("✅ " + data.message);
+  }
   loadBooked();
 });
+
+
 
 // === Load Booked Appointments ===
 async function loadBooked() {
