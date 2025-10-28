@@ -226,8 +226,8 @@ app.post("/appointments/book/:id", async (req, res) => {
       const messages = await Message.find({ category: messageType });
       if (messages.length > 0) {
         const randomMsg = messages[Math.floor(Math.random() * messages.length)];
-
-        console.log(`📱 [Instant catch-up ${h}h] Reminder sent to ${user.userName}: ${randomMsg.text}`);
+        const personalizedMsg = randomMsg.text.replace(/name/g, user.userName);
+        console.log(`📱 [Instant catch-up ${h}h] Reminder sent to ${user.userName}: ${personalizedMsg}`);
 
         reminders.push({
           messageType,
@@ -237,7 +237,7 @@ app.post("/appointments/book/:id", async (req, res) => {
 
         // Show first instant message to user
         if (!instantReminder) {
-          instantReminder = randomMsg.text;
+          instantReminder = personalizedMsg;
         }
       }
       continue;
@@ -258,9 +258,9 @@ app.post("/appointments/book/:id", async (req, res) => {
         const messages = await Message.find({ category: messageType });
         if (messages.length > 0) {
           const randomMsg = messages[Math.floor(Math.random() * messages.length)];
-
+          const personalizedMsg = randomMsg.text.replace(/name/g, user.userName);
           console.log(
-            `📲 [${new Date().toLocaleString()}] Reminder to ${user.userName}: ${randomMsg.text}`
+            `📲 [${new Date().toLocaleString()}] Reminder to ${user.userName}: ${personalizedMsg}`
           );
 
           // Update reminder as sent in DB
