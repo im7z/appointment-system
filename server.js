@@ -50,6 +50,23 @@ const messageSchema = new mongoose.Schema({
 });
 const Message = mongoose.model("Message", messageSchema);
 
+// === High-Demand Schema ===
+// Tracks popular appointment hours for each doctor, month, and day of week
+const highDemandSchema = new mongoose.Schema({
+  doctorName: { type: String, required: true },
+  year: { type: Number, required: true },          // e.g. 2025
+  month: { type: Number, required: true },         // 1–12
+  dayOfWeek: { type: Number, default: null },      // 0 = Sunday ... 6 = Saturday
+  hour: { type: Number, required: true },          // 0–23 (hour of day)
+  totalAppointments: { type: Number, default: 0 }, // learned by attended visits
+  highDemandThreshold: { type: Number, default: 3 }, // when total > threshold => high-demand
+  source: { type: String, enum: ["admin", "auto"], default: "auto" },
+  lastUpdated: { type: Date, default: Date.now }
+});
+
+highDemandSchema.index({ doctorName: 1, year: 1, month: 1, dayOfWeek: 1, hour: 1 }, { unique: true });
+
+const HighDemand = mongoose.model("HighDemand", highDemandSchema);
 
 // === 1. Add a new appointment slot ===
 app.post("/appointments/add", async (req, res) => {
@@ -180,23 +197,45 @@ app.get("/appointments/all", async (req, res) => {
 app.post("/appointments/book/:id", async (req, res) => {
   const { userName, phone } = req.body;
 
-  // --- Step 1: Update appointment as booked ---
-  const appointment = await Appointment.findByIdAndUpdate(
-    req.params.id,
-    { status: "booked", userName },
-    { new: true }
-  );
+  // 1️ Find the appointment
+  let appointment = await Appointment.findById(req.params.id);
+  if (!appointment) return res.status(404).json({ message: "Appointment not found" });
+  if (appointment.status !== "available") return res.status(400).json({ message: "Slot not available" });
 
-  // --- Step 2: Find or create user ---
+  // 2️ Find or create user
   let user = await User.findOne({ userName });
   if (!user) {
     user = new User({ userName, phone });
     await user.save();
   } else if (phone && !user.phone) {
-    // update phone if missing
     user.phone = phone;
     await user.save();
   }
+
+  // 3️ Ensure month is initialized
+  await initializeMonthIfNeeded(appointment.doctorName, appointment.date);
+
+  // 4️ Check demand for this hour
+  const demandSlot = await getEffectiveHighDemand(appointment.doctorName, new Date(appointment.date));
+  const isHighDemand = !!demandSlot && (
+    demandSlot.source === "admin" ||
+    demandSlot.totalAppointments >= demandSlot.highDemandThreshold
+  );
+
+  // 5️ Restrict At-Risk users
+  if (user.category === "At-Risk" && isHighDemand) {
+    return res.status(403).json({
+      message: ` Sorry ${user.userName}, this is a high-demand hour for ${appointment.doctorName}. Please choose another time.`
+    });
+  }
+
+  // 6️ Proceed with normal booking logic
+  appointment = await Appointment.findByIdAndUpdate(
+    req.params.id,
+    { status: "booked", userName },
+    { new: true }
+  );
+
 
   // --- Step 3: Reminder Scheduling Logic ---
   const appointmentTime = new Date(appointment.date);
@@ -227,7 +266,7 @@ app.post("/appointments/book/:id", async (req, res) => {
       if (messages.length > 0) {
         const randomMsg = messages[Math.floor(Math.random() * messages.length)];
         const personalizedMsg = randomMsg.text.replace(/name/g, user.userName);
-        console.log(`📱 [Instant catch-up ${h}h] Reminder sent to ${user.userName}: ${personalizedMsg}`);
+        console.log(` [Instant catch-up ${h}h] Reminder sent to ${user.userName}: ${personalizedMsg}`);
 
         reminders.push({
           messageType,
@@ -260,7 +299,7 @@ app.post("/appointments/book/:id", async (req, res) => {
           const randomMsg = messages[Math.floor(Math.random() * messages.length)];
           const personalizedMsg = randomMsg.text.replace(/name/g, user.userName);
           console.log(
-            `📲 [${new Date().toLocaleString()}] Reminder to ${user.userName}: ${personalizedMsg}`
+            ` [${new Date().toLocaleString()}] Reminder to ${user.userName}: ${personalizedMsg}`
           );
 
           // Update reminder as sent in DB
@@ -287,7 +326,7 @@ app.post("/appointments/book/:id", async (req, res) => {
       if (current.status === "booked") {
         const result = await updateAppointmentStatus(current._id, "missed");
         if (result) {
-          console.log(`⚠️ Auto-marked as missed & updated stats → ${result.user.userName} (${result.user.category})`);
+          console.log(` Auto-marked as missed & updated stats → ${result.user.userName} (${result.user.category})`);
         }
       }
     },
@@ -299,7 +338,7 @@ app.post("/appointments/book/:id", async (req, res) => {
   await appointment.save();
 
   // --- Step 5: Log for developer debugging ---
-  console.log(`📅 ${user.userName}'s reminders scheduled:`);
+  console.log(` ${user.userName}'s reminders scheduled:`);
   reminders.forEach((r) =>
     console.log(`- ${r.messageType} at ${r.sendTime.toLocaleString()} [${r.status}]`)
   );
@@ -360,6 +399,59 @@ app.get("/users/:userName", async (req, res) => {
   });
 });
 
+
+// === Admin: Set baseline busy hours for a doctor/month/year ===
+// Example body: { "doctorName": "Dr. Ahmed", "year": 2025, "month": 10, "hours": [9,10,11], "highDemandThreshold": 3 }
+app.post("/high-demand/setup", async (req, res) => {
+  try {
+    const { doctorName, year, month, hours, highDemandThreshold } = req.body;
+    if (!doctorName || !year || !month || !Array.isArray(hours) || hours.length === 0) {
+      return res.status(400).json({ error: "doctorName, year, month, and hours[] are required." });
+    }
+
+    await HighDemand.deleteMany({ doctorName, year, month, source: "admin" });
+
+    const entries = hours.map(h => ({
+      doctorName,
+      year: Number(year),
+      month: Number(month),
+      dayOfWeek: null,
+      hour: Number(h),
+      totalAppointments: 0,
+      highDemandThreshold: typeof highDemandThreshold === "number" ? highDemandThreshold : 3,
+      source: "admin"
+    }));
+
+    await HighDemand.insertMany(entries);
+    res.json({ message: ` Baseline saved for ${doctorName} (${month}/${year})`, count: entries.length });
+  } catch (e) {
+    console.error("Error saving baseline:", e);
+    res.status(500).json({ error: "Failed to set baseline." });
+  }
+});
+
+// === Admin: View high-demand map for doctor/month/year ===
+app.get("/high-demand", async (req, res) => {
+  try {
+    const { doctorName, year, month } = req.query;
+    if (!doctorName || !year || !month)
+      return res.status(400).json({ error: "doctorName, year, and month are required." });
+
+    const rows = await HighDemand.find({ doctorName, year: Number(year), month: Number(month) })
+      .sort({ dayOfWeek: 1, hour: 1 });
+
+    const summary = {
+      totalSlots: rows.length,
+      highDemandHours: rows.filter(r => r.totalAppointments >= r.highDemandThreshold).length
+    };
+
+    res.json({ doctorName, year: Number(year), month: Number(month), summary, rows });
+  } catch (e) {
+    console.error("Error viewing high demand:", e);
+    res.status(500).json({ error: "Failed to view high demand data." });
+  }
+});
+
 // === Helper: Update appointment and user status ===
 async function updateAppointmentStatus(appointmentId, status) {
   const appointment = await Appointment.findByIdAndUpdate(
@@ -394,12 +486,192 @@ async function updateAppointmentStatus(appointmentId, status) {
   }
 
   await user.save();
-
+  // Learn from attended appointments
+  if (status === "attended") {
+    await initializeMonthIfNeeded(appointment.doctorName, appointment.date);
+    await updateHighDemandStats(appointment);
+  }
   return { appointment, user };
 }
 
+// === High-Demand Helper Functions ===
 
+//  Initialize a month if missing — copy last year’s pattern or start fresh
+async function initializeMonthIfNeeded(doctorName, date) {
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
 
+  const exists = await HighDemand.findOne({ doctorName, year, month });
+  if (exists) return;
+
+  const prevYear = year - 1;
+  const lastYear = await HighDemand.find({ doctorName, year: prevYear, month });
+
+  if (lastYear.length > 0) {
+    const copies = lastYear.map(r => ({
+      doctorName,
+      year,
+      month,
+      dayOfWeek: r.dayOfWeek,
+      hour: r.hour,
+      totalAppointments: 0,
+      highDemandThreshold: r.highDemandThreshold,
+      source: "auto",
+      lastUpdated: new Date()
+    }));
+    await HighDemand.insertMany(copies);
+    console.log(` Initialized ${doctorName} month ${month}/${year} from ${month}/${prevYear}`);
+  } else {
+    console.log(` No previous data for ${doctorName} ${month}/${prevYear}, starting fresh.`);
+  }
+}
+
+//  Update learning — increment when appointment attended
+async function updateHighDemandStats(appointment) {
+  const date = new Date(appointment.date);
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
+  const dayOfWeek = date.getDay();
+  const hour = date.getHours();
+
+  await initializeMonthIfNeeded(appointment.doctorName, date);
+
+  await HighDemand.findOneAndUpdate(
+    { doctorName: appointment.doctorName, year, month, dayOfWeek, hour },
+    { $inc: { totalAppointments: 1 }, $set: { lastUpdated: new Date() } },
+    { upsert: true, new: true }
+  );
+}
+
+//  Fetch effective demand (current → last year → admin baseline)
+async function getEffectiveHighDemand(doctorName, date) {
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
+  const dayOfWeek = date.getDay();
+  const hour = date.getHours();
+
+  let slot =
+    (await HighDemand.findOne({ doctorName, year, month, dayOfWeek, hour })) ||
+    (await HighDemand.findOne({ doctorName, year: year - 1, month, dayOfWeek, hour })) ||
+    (await HighDemand.findOne({ doctorName, year, month, dayOfWeek: null, hour, source: "admin" })) ||
+    (await HighDemand.findOne({ doctorName, year: year - 1, month, dayOfWeek: null, hour, source: "admin" }));
+
+  return slot || null;
+}
+
+//  Recalculate Dynamic Threshold per Doctor/Month (adaptive for small clinics)
+async function recalculateDynamicThreshold(doctorName, year, month) {
+  const hours = await HighDemand.find({ doctorName, year, month });
+  if (hours.length === 0) {
+    console.log(`⚠️ No data for ${doctorName} ${month}/${year}, skipping recalculation.`);
+    return;
+  }
+
+  // Light-mode for 1–2 hours of data
+  if (hours.length < 3) {
+    const avg = hours.reduce((s, h) => s + h.totalAppointments, 0) / hours.length;
+    const threshold = avg * 1.1; // 10% above small-sample average
+    await HighDemand.updateMany({ doctorName, year, month }, { $set: { highDemandThreshold: threshold } });
+    console.log(` Light-mode threshold for ${doctorName} ${month}/${year}: ${threshold.toFixed(2)}`);
+    return;
+  }
+
+  // Full adaptive mode (≥3 hours of data)
+  const avg = hours.reduce((sum, h) => sum + h.totalAppointments, 0) / hours.length;
+  const threshold = avg * 1.2; // 120% of average attendance
+
+  // Top 25% busiest hours define the real cutoff
+  const sorted = [...hours].sort((a, b) => b.totalAppointments - a.totalAppointments);
+  const top25Index = Math.floor(hours.length * 0.25);
+  const top25Cutoff = sorted[top25Index]?.totalAppointments || threshold;
+  const newThreshold = Math.max(threshold, top25Cutoff);
+
+  await HighDemand.updateMany({ doctorName, year, month }, { $set: { highDemandThreshold: newThreshold } });
+
+  console.log(` Adaptive threshold for ${doctorName} ${month}/${year}: ${newThreshold.toFixed(2)} (avg=${avg.toFixed(2)})`);
+}
+
+//  Limit how many hours are high-demand (max 50% of total)
+async function limitHighDemandHours(doctorName, year, month, maxPercent = 0.5) {
+  const hours = await HighDemand.find({ doctorName, year, month });
+  const totalHours = hours.length;
+  if (totalHours === 0) return;
+
+  const maxHigh = Math.floor(totalHours * maxPercent);
+  const sorted = [...hours].sort((a, b) => b.totalAppointments - a.totalAppointments);
+  const top = sorted.slice(0, maxHigh);
+
+  for (const h of hours) {
+    const isHigh = top.some(t => t.hour === h.hour && t.dayOfWeek === h.dayOfWeek);
+    h.highDemandThreshold = isHigh ? h.highDemandThreshold : Number.MAX_SAFE_INTEGER;
+    await h.save();
+  }
+  console.log(` ${doctorName} ${month}/${year}: limited to ${maxHigh}/${totalHours} peak hours.`);
+}
+
+//  Month-End Learning — refresh data & recalc
+cron.schedule("59 23 28-31 * *", async () => {
+  const now = new Date();
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1;
+  console.log(` Month-end learning for ${month}/${year}...`);
+
+  const start = new Date(year, month - 1, 1);
+  const end = new Date(year, month, 0, 23, 59, 59);
+  const attended = await Appointment.find({ status: "attended", date: { $gte: start, $lte: end } });
+  if (attended.length === 0) return console.log("No attended appointments.");
+
+  // Group by doctor/hour
+  const grouped = {};
+  for (const app of attended) {
+    const d = new Date(app.date);
+    const key = `${app.doctorName}-${d.getHours()}`;
+    grouped[key] = (grouped[key] || 0) + 1;
+  }
+
+  // Update totals
+  for (const key in grouped) {
+    const [doctorName, hour] = key.split("-");
+    await HighDemand.findOneAndUpdate(
+      { doctorName, year, month, hour: Number(hour) },
+      { $inc: { totalAppointments: grouped[key] }, $set: { lastUpdated: new Date() } },
+      { upsert: true }
+    );
+  }
+
+  console.log(` Month-end data merged for ${Object.keys(grouped).length} hours.`);
+}, { timezone: "Asia/Riyadh" });
+
+//  Monthly recalculation (1st day of month at 2 AM)
+cron.schedule("0 2 1 * *", async () => {
+  console.log("🔁 Recalculating monthly thresholds...");
+  const doctors = await HighDemand.distinct("doctorName");
+  const now = new Date();
+  const year = now.getFullYear();
+  const prevMonth = now.getMonth(); // previous month index
+
+  for (const doctor of doctors) {
+    await recalculateDynamicThreshold(doctor, year, prevMonth);
+    await limitHighDemandHours(doctor, year, prevMonth);
+  }
+  console.log(" Monthly recalculation done.");
+});
+
+//  Late-Release Rule — every hour, open unbooked high-demand slots 2h before start
+cron.schedule("0 * * * *", async () => {
+  const now = new Date();
+  const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000);
+
+  const soon = await Appointment.find({ status: "available", date: { $gte: now, $lte: twoHoursLater } });
+  for (const a of soon) {
+    const demand = await getEffectiveHighDemand(a.doctorName, a.date);
+    if (demand && demand.totalAppointments >= demand.highDemandThreshold) {
+      demand.highDemandThreshold = Number.MAX_SAFE_INTEGER; // unlock
+      await demand.save();
+      console.log(` Released high-demand slot for ${a.doctorName} at ${a.date.toLocaleString()}`);
+    }
+  }
+});
 
 // === Start the Server ===
 app.listen(3000, () => {
