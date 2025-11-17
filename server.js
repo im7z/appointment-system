@@ -37,12 +37,34 @@ const userSchema = new mongoose.Schema({
 const User = mongoose.model("User", userSchema);
 
 // === Telegram Bot Setup ===
-const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_TOKEN = process.env.BOT_TOKEN;
+const PUBLIC_BASE_URL = "https://appointment-system-iw83.onrender.com"; // your Render URL
+const WEBHOOK_URL = `${PUBLIC_BASE_URL}/webhook`;
 
-bot = new TelegramBot(TELEGRAM_TOKEN);
+let bot = null;
 
-if (TELEGRAM_TOKEN) {
-  console.log("✅ Telegram bot started");
+if (!TELEGRAM_TOKEN) {
+  console.warn("⚠️ TELEGRAM_BOT_TOKEN is not set. Telegram reminders are disabled.");
+} else {
+  bot = new TelegramBot(TELEGRAM_TOKEN); // no polling
+  console.log("✅ Telegram bot instance created");
+
+  // === Auto-set webhook on startup ===
+  (async () => {
+    try {
+      const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/setWebhook`;
+      const res = await axios.get(url, {
+        params: {
+          url: WEBHOOK_URL,
+          drop_pending_updates: true, // clears old stuck updates
+        },
+      });
+
+      console.log("✅ setWebhook response:", res.data);
+    } catch (err) {
+      console.error("❌ Failed to set Telegram webhook automatically:", err.response?.data || err.message);
+    }
+  })();
 
   // Tracks link steps per chat
   const linkSteps = new Map();
@@ -51,9 +73,14 @@ if (TELEGRAM_TOKEN) {
     const chatId = msg.chat.id;
     const text = (msg.text || "").trim();
 
+    console.log("📩 Incoming Telegram message:", {
+      chatId,
+      text,
+    });
+
     // Check if this chat is already linked
     const alreadyLinked = await User.findOne({
-      telegramChatId: String(chatId)
+      telegramChatId: String(chatId),
     });
 
     // === 1) /start ===
@@ -70,8 +97,8 @@ if (TELEGRAM_TOKEN) {
       return bot.sendMessage(
         chatId,
         "👋 Welcome to the Behavior Clinic bot!\n\n" +
-        "Please type your *clinic username* so I can connect your account.\n\n" +
-        "Example:  `nourah`",
+          "Please type your *clinic username* so I can connect your account.\n\n" +
+          "Example:  `nourah`",
         { parse_mode: "Markdown" }
       );
     }
@@ -83,7 +110,6 @@ if (TELEGRAM_TOKEN) {
 
     // === 2) User must type their username ===
     if (linkSteps.get(chatId) === "await_username") {
-
       // Prevent duplicate linking
       if (linkSteps.get(chatId) === "completed") return;
 
@@ -107,7 +133,7 @@ if (TELEGRAM_TOKEN) {
             attendedCount: 0,
             missedCount: 0,
             attendanceRate: 0,
-            category: "Good"
+            category: "Good",
           });
 
           console.log("🆕 Created new API user + linked Telegram:", typedUsername);
@@ -116,27 +142,22 @@ if (TELEGRAM_TOKEN) {
         }
 
         // Send success message
-        bot.sendMessage(
+        await bot.sendMessage(
           chatId,
           `✅ Great, *${user.userName}*! Your Telegram is now linked.\n\n` +
-          "You will receive appointment reminders here. 🎉",
+            "You will receive appointment reminders here. 🎉",
           { parse_mode: "Markdown" }
         );
 
         // Mark linking as completed = important
         linkSteps.set(chatId, "completed");
-
       } catch (err) {
         console.error("❌ Error linking Telegram:", err);
         bot.sendMessage(chatId, "❌ Something went wrong. Please try again later.");
       }
     }
   });
-
-} else {
-  console.warn("⚠️ TELEGRAM_BOT_TOKEN is not set. Telegram reminders are disabled.");
 }
-
 
 // Helper function to send a reminder (safe)
 async function sendTelegramReminder(user, text) {
@@ -151,11 +172,17 @@ async function sendTelegramReminder(user, text) {
   }
 }
 
-app.post('/webhook', (req, res) => {
+// === Webhook endpoint ===
+app.post("/webhook", (req, res) => {
   const msg = req.body; // Telegram message object
-  console.log("Received message:", msg);
+  console.log("📥 Received webhook update:", msg);
 
-  bot.processUpdate(msg);  // Process the incoming update
+  if (bot) {
+    bot.processUpdate(msg); // Process the incoming update
+  } else {
+    console.error("❌ bot is not initialized, cannot process update.");
+  }
+
   res.sendStatus(200); // Respond to Telegram that the message was received successfully
 });
 
