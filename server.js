@@ -16,7 +16,8 @@ app.use(cors());
 app.use(express.static("public"));
 
 // === Connect to MongoDB ===
-mongoose.connect("mongodb://127.0.0.1:27017/appointments");
+const MONGO_URL = process.env.MONGO_URL || "mongodb://127.0.0.1:27017/appointments";
+mongoose.connect(MONGO_URL);
 
 // Stores user info, attendance stats, behavior classification, and phone number
 const userSchema = new mongoose.Schema({
