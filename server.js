@@ -36,6 +36,7 @@ const userSchema = new mongoose.Schema({
 });
 const User = mongoose.model("User", userSchema);
 
+const axios = require("axios");
 // === Telegram Bot Setup ===
 const TELEGRAM_TOKEN = process.env.BOT_TOKEN;
 const PUBLIC_BASE_URL = "https://appointment-system-iw83.onrender.com"; // your Render URL
