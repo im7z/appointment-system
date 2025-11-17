@@ -9,6 +9,7 @@ const moment = require("moment");
 require("moment/locale/ar"); // Arabic locale
 moment.locale("ar");
 const PORT = process.env.PORT || 3000;
+process.env.TZ = "Asia/Riyadh";
 // === Create Express App ===
 const app = express();
 app.use(express.json());
