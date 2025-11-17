@@ -398,6 +398,7 @@ app.post("/appointments/book/:id", async (req, res) => {
 
   for (const h of reminderHours) {
     const reminderTime = new Date(appointmentTime - h * 60 * 60 * 1000);
+
     // === Case 1: Reminder time already passed ===
     if (reminderTime <= now) {
 
@@ -445,10 +446,12 @@ app.post("/appointments/book/:id", async (req, res) => {
     });
 
     const cronTime = `${reminderTime.getMinutes()} ${reminderTime.getHours()} ${reminderTime.getDate()} ${reminderTime.getMonth() + 1} *`;
+    console.log("Scheduling cron job with time:", cronTime);
 
     cron.schedule(
       cronTime,
       async () => {
+        console.log(`[Cron Job Triggered] Reminder for ${user.userName} at: ${new Date().toLocaleString()}`);
         const messages = await Message.find({ category: messageType });
         if (messages.length > 0) {
           const randomMsg = messages[Math.floor(Math.random() * messages.length)];
@@ -475,6 +478,7 @@ app.post("/appointments/book/:id", async (req, res) => {
 
           await sendTelegramReminder(user, finalMessage);
 
+          console.log("Updating reminder for appointment:", appointment._id);
           // Update reminder as sent in DB
           await Appointment.updateOne(
             { _id: appointment._id, "reminders.sendTime": reminderTime },
