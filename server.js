@@ -400,11 +400,6 @@ app.post("/appointments/book/:id", async (req, res) => {
     // === Case 1: Reminder time already passed ===
     if (reminderTime <= now) {
 
-      // ❗ If we already sent ONE instant reminder → skip all others
-      if (instantReminder) {
-        continue;
-      }
-
       const messages = await Message.find({ category: messageType });
       if (messages.length > 0) {
         const randomMsg = messages[Math.floor(Math.random() * messages.length)];
