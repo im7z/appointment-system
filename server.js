@@ -924,8 +924,8 @@ cron.schedule("0 * * * *", async () => {
 }, { timezone: "Asia/Riyadh" });
 
 
-// === Start the Server ===
-app.listen(PORT, () => {
-  console.log(`Server running on http://localhost:${PORT}`);
-});
+// // === Start the Server ===
+// app.listen(PORT, () => {
+//   console.log(`Server running on http://localhost:${PORT}`);
+// });
 
