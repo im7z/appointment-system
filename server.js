@@ -1,9 +1,14 @@
 // === Import Required Packages ===
+require("dotenv").config();
 const express = require("express");
 const mongoose = require("mongoose");
 const cors = require("cors");
 const cron = require("node-cron"); // for scheduling automatic reminders
-
+const TelegramBot = require("node-telegram-bot-api");
+const moment = require("moment");
+require("moment/locale/ar"); // Arabic locale
+moment.locale("ar");
+const PORT = process.env.PORT || 3000;
 // === Create Express App ===
 const app = express();
 app.use(express.json());
@@ -17,6 +22,10 @@ mongoose.connect("mongodb://127.0.0.1:27017/appointments");
 const userSchema = new mongoose.Schema({
   userName: String,
   phone: String, // phone number used for future SMS reminders
+
+  // New: Telegram chat id for reminders
+  telegramChatId: { type: String, default: null },
+
   score: { type: Number, default: 0 }, // loyalty points (rewards only)
   attendedCount: { type: Number, default: 0 }, // total attended
   missedCount: { type: Number, default: 0 }, // total missed
@@ -24,6 +33,122 @@ const userSchema = new mongoose.Schema({
   category: { type: String, default: "Good" } // behavior class (Good, Very Good, At-Risk)
 });
 const User = mongoose.model("User", userSchema);
+
+// === Telegram Bot Setup ===
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+
+let bot = null;
+
+if (TELEGRAM_TOKEN) {
+  bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
+  console.log("✅ Telegram bot started");
+
+  // Tracks link steps per chat
+  const linkSteps = new Map();
+
+  bot.on("message", async (msg) => {
+    const chatId = msg.chat.id;
+    const text = (msg.text || "").trim();
+
+    // Check if this chat is already linked
+    const alreadyLinked = await User.findOne({
+      telegramChatId: String(chatId)
+    });
+
+    // === 1) /start ===
+    if (text === "/start") {
+      if (alreadyLinked) {
+        return bot.sendMessage(
+          chatId,
+          "✅ Your Telegram is already linked. You will keep receiving reminders."
+        );
+      }
+
+      linkSteps.set(chatId, "await_username");
+
+      return bot.sendMessage(
+        chatId,
+        "👋 Welcome to the Behavior Clinic bot!\n\n" +
+        "Please type your *clinic username* so I can connect your account.\n\n" +
+        "Example:  `nourah`",
+        { parse_mode: "Markdown" }
+      );
+    }
+
+    // If not expecting a username → ignore
+    if (!linkSteps.has(chatId)) {
+      return bot.sendMessage(chatId, "💡 Send /start to link your account.");
+    }
+
+    // === 2) User must type their username ===
+    if (linkSteps.get(chatId) === "await_username") {
+
+      // Prevent duplicate linking
+      if (linkSteps.get(chatId) === "completed") return;
+
+      const typedUsername = text;
+
+      try {
+        // Case-insensitive lookup: Nourah == nourah == NOURAH
+        let user = await User.findOneAndUpdate(
+          { userName: new RegExp(`^${typedUsername}$`, "i") },
+          { telegramChatId: String(chatId) },
+          { new: true }
+        );
+
+        // If user doesn't exist in API DB → create it
+        if (!user) {
+          user = await User.create({
+            userName: typedUsername,
+            telegramChatId: String(chatId),
+            phone: null,
+            score: 0,
+            attendedCount: 0,
+            missedCount: 0,
+            attendanceRate: 0,
+            category: "Good"
+          });
+
+          console.log("🆕 Created new API user + linked Telegram:", typedUsername);
+        } else {
+          console.log("🔗 Updated Telegram chatId for:", user.userName);
+        }
+
+        // Send success message
+        bot.sendMessage(
+          chatId,
+          `✅ Great, *${user.userName}*! Your Telegram is now linked.\n\n` +
+          "You will receive appointment reminders here. 🎉",
+          { parse_mode: "Markdown" }
+        );
+
+        // Mark linking as completed = important
+        linkSteps.set(chatId, "completed");
+
+      } catch (err) {
+        console.error("❌ Error linking Telegram:", err);
+        bot.sendMessage(chatId, "❌ Something went wrong. Please try again later.");
+      }
+    }
+  });
+
+} else {
+  console.warn("⚠️ TELEGRAM_BOT_TOKEN is not set. Telegram reminders are disabled.");
+}
+
+
+// Helper function to send a reminder (safe)
+async function sendTelegramReminder(user, text) {
+  if (!bot) return; // bot not configured
+  if (!user || !user.telegramChatId) return; // user not linked
+
+  try {
+    await bot.sendMessage(user.telegramChatId, text);
+    console.log(`✅ Telegram reminder sent to ${user.userName}`);
+  } catch (err) {
+    console.error("❌ Failed to send Telegram message:", err.message);
+  }
+}
 
 // === Appointment Schema ===
 // Holds each appointment info and who booked it
@@ -156,6 +281,7 @@ app.post("/appointments/add", async (req, res) => {
     }
 
     await Appointment.insertMany(slots);
+    console.log(` ${slots.length} appointment slots added successfully.`);
     res.json({
       message: ` ${slots.length} appointment slots added successfully.`,
       totalAdded: slots.length,
@@ -225,9 +351,10 @@ app.post("/appointments/book/:id", async (req, res) => {
   // 5️ Restrict At-Risk users
   if (user.category === "At-Risk" && isHighDemand) {
     return res.status(403).json({
-      message: ` Sorry ${user.userName}, this is a high-demand hour for ${appointment.doctorName}. Please choose another time.`
+      message: `عذرًا يا ${user.userName}، هذا الموعد عالي الطلب للدكتور/ة ${appointment.doctorName}. بسبب غيابك السابق تم تقييد هذا الوقت مؤقتًا، والالتزام القادم يعيد فتح هذه الأوقات لك. الرجاء اختيار وقت آخر.`
     });
   }
+
 
   // 6️ Proceed with normal booking logic
   appointment = await Appointment.findByIdAndUpdate(
@@ -259,27 +386,48 @@ app.post("/appointments/book/:id", async (req, res) => {
 
   for (const h of reminderHours) {
     const reminderTime = new Date(appointmentTime - h * 60 * 60 * 1000);
-
     // === Case 1: Reminder time already passed ===
     if (reminderTime <= now) {
+
+      // ❗ If we already sent ONE instant reminder → skip all others
+      if (instantReminder) {
+        continue;
+      }
+
       const messages = await Message.find({ category: messageType });
       if (messages.length > 0) {
         const randomMsg = messages[Math.floor(Math.random() * messages.length)];
         const personalizedMsg = randomMsg.text.replace(/name/g, user.userName);
-        console.log(` [Instant catch-up ${h}h] Reminder sent to ${user.userName}: ${personalizedMsg}`);
 
+        console.log(` [Instant catch-up ${h}h] Reminder for ${user.userName}: ${personalizedMsg}`);
+
+        // Format date + time Arabic using moment
+        const dateStr = moment(appointment.date).format("dddd، DD MMMM YYYY");
+        const timeStr = moment(appointment.date).format("hh:mm A");
+
+        const clinicName = " behavior-based Clinic";
+
+        const finalMessage =
+          `${clinicName}\n\n` +
+          `${personalizedMsg}\n\n` +
+          ` موعدك مع الدكتور/ه ${appointment.doctorName} — ${dateStr} — ${timeStr}`;
+
+        console.log(`Sending reminder: ${finalMessage}`);
+
+        await sendTelegramReminder(user, finalMessage);
+
+        // Mark that we already sent ONE instant reminder
+        instantReminder = personalizedMsg;
+
+        // Save the reminder entry
         reminders.push({
           messageType,
           sendTime: now,
           status: "sent"
         });
-
-        // Show first instant message to user
-        if (!instantReminder) {
-          instantReminder = personalizedMsg;
-        }
       }
-      continue;
+
+      continue; // Stop checking next reminders
     }
 
     // === Case 2: Schedule future reminder ===
@@ -298,9 +446,27 @@ app.post("/appointments/book/:id", async (req, res) => {
         if (messages.length > 0) {
           const randomMsg = messages[Math.floor(Math.random() * messages.length)];
           const personalizedMsg = randomMsg.text.replace(/name/g, user.userName);
+
           console.log(
             ` [${new Date().toLocaleString()}] Reminder to ${user.userName}: ${personalizedMsg}`
           );
+
+          // Format date + time Arabic using moment
+          const dateStr = moment(appointment.date).format("dddd، DD MMMM YYYY");
+          const timeStr = moment(appointment.date).format("hh:mm A");
+
+          // Clinic name (you can change it)
+          const clinicName = " behavior-based Clinic";
+
+          // Final formatted message
+          const finalMessage =
+            `${clinicName}\n\n` +                // Title added
+            `${personalizedMsg}\n\n` +           // Nudge message
+            ` موعدك مع الدكتور/ه ${appointment.doctorName} — ${dateStr} — ${timeStr}`;   //  One-line details
+
+          console.log(`Sending reminder: ${finalMessage}`);
+
+          await sendTelegramReminder(user, finalMessage);
 
           // Update reminder as sent in DB
           await Appointment.updateOne(
@@ -327,6 +493,13 @@ app.post("/appointments/book/:id", async (req, res) => {
         const result = await updateAppointmentStatus(current._id, "missed");
         if (result) {
           console.log(` Auto-marked as missed & updated stats → ${result.user.userName} (${result.user.category})`);
+          // --- SEND GOOGLE FORM FEEDBACK ---
+          const formLink = "https://docs.google.com/forms/d/e/1FAIpQLSfodMr2Jprl32tI8jQ9qgE1--2NSFQR6o2DOEiNki23H0RQ8w/viewform?usp=header"; // replace with your form
+          await sendTelegramReminder(
+            result.user,
+            ` نود معرفة تجربتك اليوم، هل تذكّرت موعدك أم لا؟\n\n` +
+            ` الرجاء تعبئة النموذج:\n${formLink}`
+          );
         }
       }
     },
@@ -379,6 +552,8 @@ app.get("/users/:userName", async (req, res) => {
   const user = await User.findOne({ userName: req.params.userName });
   if (!user) return res.status(404).json({ message: "User not found" });
 
+  const telegramLinked = !!user.telegramChatId;
+
   // if admin view requested, send full data
   if (req.query.view === "admin") {
     return res.json({
@@ -388,15 +563,62 @@ app.get("/users/:userName", async (req, res) => {
       attended: user.attendedCount,
       missed: user.missedCount,
       attendanceRate: user.attendanceRate?.toFixed(2) || 0,
-      category: user.category || "Good"
+      category: user.category || "Good",
+      telegramChatId: user.telegramChatId,
+      telegramLinked
     });
   }
 
-  // user view (only loyalty points)
+  // user view
   return res.json({
     userName: user.userName,
-    score: user.score
+    score: user.score,
+    telegramLinked
   });
+});
+
+// Get all users (Admin purpose)
+app.get("/users", async (req, res) => {
+  try {
+    const users = await User.find().lean();
+    res.json(users);
+  } catch (err) {
+    console.error("Error fetching users:", err);
+    res.status(500).json({ error: "Server error" });
+  }
+});
+
+// === Admin override user category (for testing) ===
+app.post("/admin/set-category", async (req, res) => {
+  try {
+    const { userName, category } = req.body;
+
+    if (!userName || !category) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    const allowed = ["Good", "Very Good", "At-Risk"];
+    if (!allowed.includes(category)) {
+      return res.status(400).json({ error: "Invalid category" });
+    }
+
+    const user = await User.findOneAndUpdate(
+      { userName },
+      { category },      // Temporary override
+      { new: true }
+    );
+
+    if (!user) return res.status(404).json({ error: "User not found" });
+
+    return res.json({
+      message: `Category for ${userName} changed to ${category}`,
+      user
+    });
+
+  } catch (err) {
+    console.error("Error updating category:", err);
+    return res.status(500).json({ error: "Server error" });
+  }
 });
 
 
@@ -657,24 +879,47 @@ cron.schedule("0 2 1 * *", async () => {
   console.log(" Monthly recalculation done.");
 });
 
-//  Late-Release Rule — every hour, open unbooked high-demand slots 2h before start
+//  Late-Release Rule + Cleanup of past available appointments
 cron.schedule("0 * * * *", async () => {
   const now = new Date();
+
+  // === Cleanup past available appointments ===
+  try {
+    const removed = await Appointment.deleteMany({
+      date: { $lt: now },
+      status: "available"
+    });
+
+    if (removed.deletedCount > 0) {
+      console.log(` Cleanup: removed ${removed.deletedCount} expired unbooked appointments.`);
+    }
+  } catch (err) {
+    console.error(" Error during cleanup:", err);
+  }
+
+  // === Late-release high-demand slots ===
   const twoHoursLater = new Date(now.getTime() + 2 * 60 * 60 * 1000);
 
-  const soon = await Appointment.find({ status: "available", date: { $gte: now, $lte: twoHoursLater } });
+  const soon = await Appointment.find({
+    status: "available",
+    date: { $gte: now, $lte: twoHoursLater }
+  });
+
   for (const a of soon) {
     const demand = await getEffectiveHighDemand(a.doctorName, a.date);
     if (demand && demand.totalAppointments >= demand.highDemandThreshold) {
       demand.highDemandThreshold = Number.MAX_SAFE_INTEGER; // unlock
       await demand.save();
-      console.log(` Released high-demand slot for ${a.doctorName} at ${a.date.toLocaleString()}`);
+      console.log(
+        ` Released high-demand slot for ${a.doctorName} at ${a.date.toLocaleString()}`
+      );
     }
   }
-});
+}, { timezone: "Asia/Riyadh" });
+
 
 // === Start the Server ===
-app.listen(3000, () => {
-  console.log("Server running on http://localhost:3000");
+app.listen(PORT, () => {
+  console.log(`Server running on http://localhost:${PORT}`);
 });
 
