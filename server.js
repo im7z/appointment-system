@@ -41,7 +41,6 @@ const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 let bot = null;
 
 if (TELEGRAM_TOKEN) {
-  bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
   console.log("✅ Telegram bot started");
 
   // Tracks link steps per chat
@@ -193,6 +192,16 @@ const highDemandSchema = new mongoose.Schema({
 highDemandSchema.index({ doctorName: 1, year: 1, month: 1, dayOfWeek: 1, hour: 1 }, { unique: true });
 
 const HighDemand = mongoose.model("HighDemand", highDemandSchema);
+
+
+app.post('/webhook', (req, res) => {
+  const msg = req.body; // Telegram message object
+  console.log("Received message:", msg);
+
+  bot.processUpdate(msg);  // Process the incoming update
+  res.sendStatus(200); // Respond to Telegram that the message was received successfully
+});
+
 
 // === 1. Add a new appointment slot ===
 app.post("/appointments/add", async (req, res) => {
