@@ -649,6 +649,7 @@ app.post("/admin/set-category", async (req, res) => {
 
     if (!user) return res.status(404).json({ error: "User not found" });
 
+    console.log( `Category for ${userName} changed to ${category}`);
     return res.json({
       message: `Category for ${userName} changed to ${category}`,
       user
@@ -685,6 +686,7 @@ app.post("/high-demand/setup", async (req, res) => {
 
     await HighDemand.insertMany(entries);
     res.json({ message: ` Baseline saved for ${doctorName} (${month}/${year})`, count: entries.length });
+    console.log(` Baseline saved for ${doctorName} (${month}/${year})`);
   } catch (e) {
     console.error("Error saving baseline:", e);
     res.status(500).json({ error: "Failed to set baseline." });
