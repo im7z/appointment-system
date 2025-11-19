@@ -97,7 +97,7 @@ if (!TELEGRAM_TOKEN) {
 
       return bot.sendMessage(
         chatId,
-        "👋 Welcome to the Behavior Clinic bot!\n\n" +
+        "👋 Welcome to the QU Clinic bot!\n\n" +
           "Please type your *clinic username* so I can connect your account.\n\n" +
           "Example:  `nourah`",
         { parse_mode: "Markdown" }
@@ -441,7 +441,7 @@ app.post("/appointments/book/:id", async (req, res) => {
         const dateStr = moment(appointment.date).format("dddd، DD MMMM YYYY");
         const timeStr = moment(appointment.date).format("hh:mm A");
 
-        const clinicName = " behavior-based Clinic";
+        const clinicName = " QU Clinic";
 
         const finalMessage =
           `${clinicName}\n\n` +
@@ -494,7 +494,7 @@ app.post("/appointments/book/:id", async (req, res) => {
           const timeStr = moment(appointment.date).format("hh:mm A");
 
           // Clinic name (you can change it)
-          const clinicName = " behavior-based Clinic";
+          const clinicName = " QU Clinic";
 
           // Final formatted message
           const finalMessage =
