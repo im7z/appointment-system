@@ -20,9 +20,13 @@ app.use(express.static("public"));
 const MONGO_URL = process.env.MONGO_URL || "mongodb://127.0.0.1:27017/appointments";
 mongoose.connect(MONGO_URL);
 
+
 // Stores user info, attendance stats, behavior classification, and phone number
 const userSchema = new mongoose.Schema({
-  userName: String,
+  userName: String, // username used for login + booking + telegram linking
+
+  displayName: { type: String, default: null },// new: friendly name shown to the user
+
   phone: String, // phone number used for future SMS reminders
 
   // New: Telegram chat id for reminders
@@ -35,6 +39,8 @@ const userSchema = new mongoose.Schema({
   category: { type: String, default: "Good" } // behavior class (Good, Very Good, At-Risk)
 });
 const User = mongoose.model("User", userSchema);
+
+
 
 const axios = require("axios");
 // === Telegram Bot Setup ===
@@ -98,8 +104,8 @@ if (!TELEGRAM_TOKEN) {
       return bot.sendMessage(
         chatId,
         "👋 Welcome to the QU Clinic bot!\n\n" +
-          "Please type your *clinic username* so I can connect your account.\n\n" +
-          "Example:  `nourah`",
+        "Please type your *clinic username* so I can connect your account.\n\n" +
+        "Example:  `omar - omar12`",
         { parse_mode: "Markdown" }
       );
     }
@@ -114,39 +120,32 @@ if (!TELEGRAM_TOKEN) {
       // Prevent duplicate linking
       if (linkSteps.get(chatId) === "completed") return;
 
-      const typedUsername = text;
+      const typedUsername = text.trim().toLowerCase();
 
       try {
-        // Case-insensitive lookup: Nourah == nourah == NOURAH
+        // Username must NOT contain spaces
+        if (/\s/.test(typedUsername)) {
+          return bot.sendMessage(chatId, "❌ Username cannot contain spaces. Try again.");
+        }
+
+        // Look for exact match
         let user = await User.findOneAndUpdate(
-          { userName: new RegExp(`^${typedUsername}$`, "i") },
+          { userName: typedUsername },
           { telegramChatId: String(chatId) },
           { new: true }
         );
 
-        // If user doesn't exist in API DB → create it
         if (!user) {
-          user = await User.create({
-            userName: typedUsername,
-            telegramChatId: String(chatId),
-            phone: null,
-            score: 0,
-            attendedCount: 0,
-            missedCount: 0,
-            attendanceRate: 0,
-            category: "Good",
-          });
-
-          console.log("🆕 Created new API user + linked Telegram:", typedUsername);
-        } else {
-          console.log("🔗 Updated Telegram chatId for:", user.userName);
+          return bot.sendMessage(
+            chatId,
+            "❌ Username not found.\nPlease sign up in the clinic app first, then try again."
+          );
         }
-
         // Send success message
         await bot.sendMessage(
           chatId,
           `✅ Great, *${user.userName}*! Your Telegram is now linked.\n\n` +
-            "You will receive appointment reminders here. 🎉",
+          "You will receive appointment reminders here. 🎉",
           { parse_mode: "Markdown" }
         );
 
@@ -186,6 +185,57 @@ app.post("/webhook", (req, res) => {
 
   res.sendStatus(200); // Respond to Telegram that the message was received successfully
 });
+
+
+
+// =======================================================
+//   USER SYNC (from Clinic) 
+// =======================================================
+app.post("/users/register", async (req, res) => {
+  try {
+    const { userName, displayName, phone } = req.body;
+
+    if (!userName) {
+      return res.status(400).json({ error: "Missing username" });
+    }
+
+    let user = await User.findOne({ userName });
+
+    // If user does NOT exist → create it
+    if (!user) {
+      user = await User.create({
+        userName,
+        displayName,
+        phone,
+        score: 0,
+        attendedCount: 0,
+        missedCount: 0,
+        attendanceRate: 0,
+        category: "Good",
+      });
+
+      console.log(" API User created:", userName);
+    }
+    else {
+      // Update displayName/phone if changed
+      user.displayName = displayName || user.displayName;
+      user.phone = phone || user.phone;
+      await user.save();
+
+      console.log(" API User synced:", userName);
+    }
+
+    res.json({
+      message: "User synced successfully",
+      user
+    });
+
+  } catch (err) {
+    console.error(" API /users/register error:", err);
+    res.status(500).json({ error: "Failed to sync user" });
+  }
+});
+
 
 // === Appointment Schema ===
 // Holds each appointment info and who booked it
@@ -368,15 +418,25 @@ app.post("/appointments/book/:id", async (req, res) => {
   if (!appointment) return res.status(404).json({ message: "Appointment not found" });
   if (appointment.status !== "available") return res.status(400).json({ message: "Slot not available" });
 
-  // 2️ Find or create user
-  let user = await User.findOne({ userName });
+  // 2️ Find user (case-insensitive)
+  let user = await User.findOne({
+    userName: new RegExp(`^${userName}$`, "i")
+  });
+
   if (!user) {
-    user = new User({ userName, phone });
-    await user.save();
-  } else if (phone && !user.phone) {
+    return res.status(400).json({
+      message: "User not found in system. Please re-login."
+    });
+  }
+
+
+  if (phone && !user.phone) {
     user.phone = phone;
     await user.save();
   }
+
+
+
 
   // 3️ Ensure month is initialized
   await initializeMonthIfNeeded(appointment.doctorName, appointment.date);
@@ -423,6 +483,8 @@ app.post("/appointments/book/:id", async (req, res) => {
 
   // Prepare reminder list for DB + scheduling
   const reminders = [];
+  const usedMessages = [];
+
 
   for (const h of reminderHours) {
     const reminderTime = new Date(appointmentTime - h * 60 * 60 * 1000);
@@ -430,41 +492,48 @@ app.post("/appointments/book/:id", async (req, res) => {
     // === Case 1: Reminder time already passed ===
     if (reminderTime <= now) {
 
+      // Mark reminder as SENT in DB list (we will save after this)
+      reminders.push({
+        messageType,
+        sendTime: now,
+        status: "sent"
+      });
+
+      // If already sent an instant reminder → DO NOT send again
+      if (instantReminder) continue;
+
+      // --- Send ONLY ONE instant message ---
       const messages = await Message.find({ category: messageType });
       if (messages.length > 0) {
-        const randomMsg = messages[Math.floor(Math.random() * messages.length)];
-        const personalizedMsg = randomMsg.text.replace(/name/g, user.userName);
 
-        console.log(` [Instant catch-up ${h}h] Reminder for ${user.userName}: ${personalizedMsg}`);
+        const randomMsg = pickUniqueMessage(messages, usedMessages);
 
-        // Format date + time Arabic using moment
+        const nameToShow = user.displayName || user.userName;
+        const personalizedMsg = randomMsg.text.replace(/name/g, nameToShow);
+
+        console.log(` [Instant catch-up] Reminder for ${user.userName}: ${personalizedMsg}`);
+
         const dateStr = moment(appointment.date).format("dddd، DD MMMM YYYY");
         const timeStr = moment(appointment.date).format("hh:mm A");
 
+        // Clinic name (you can change it)
         const clinicName = " QU Clinic";
 
+        // Final formatted message
         const finalMessage =
-          `${clinicName}\n\n` +
-          `${personalizedMsg}\n\n` +
-          ` موعدك مع الدكتور/ه ${appointment.doctorName} — ${dateStr} — ${timeStr}`;
-
-        console.log(`Sending reminder: ${finalMessage}`);
+          `${clinicName}\n\n` +                // Title added
+          `${personalizedMsg}\n\n` +           // Nudge message
+          ` موعدك مع الدكتور/ه ${appointment.doctorName} — ${dateStr} — ${timeStr}`;   //  One-line details
 
         await sendTelegramReminder(user, finalMessage);
 
-        // Mark that we already sent ONE instant reminder
-        instantReminder = personalizedMsg;
-
-        // Save the reminder entry
-        reminders.push({
-          messageType,
-          sendTime: now,
-          status: "sent"
-        });
+        // Only ONE instant reminder
+        instantReminder = true;
       }
 
-      continue; // Stop checking next reminders
+      continue;
     }
+
 
     // === Case 2: Schedule future reminder ===
     reminders.push({
@@ -482,8 +551,12 @@ app.post("/appointments/book/:id", async (req, res) => {
         console.log(`[Cron Job Triggered] Reminder for ${user.userName} at: ${new Date().toLocaleString()}`);
         const messages = await Message.find({ category: messageType });
         if (messages.length > 0) {
-          const randomMsg = messages[Math.floor(Math.random() * messages.length)];
-          const personalizedMsg = randomMsg.text.replace(/name/g, user.userName);
+
+          const randomMsg = pickUniqueMessage(messages, usedMessages);
+
+          const nameToShow = user.displayName || user.userName;
+          const personalizedMsg = randomMsg.text.replace(/name/g, nameToShow);
+
 
           console.log(
             ` [${new Date().toLocaleString()}] Reminder to ${user.userName}: ${personalizedMsg}`
@@ -649,7 +722,7 @@ app.post("/admin/set-category", async (req, res) => {
 
     if (!user) return res.status(404).json({ error: "User not found" });
 
-    console.log( `Category for ${userName} changed to ${category}`);
+    console.log(`Category for ${userName} changed to ${category}`);
     return res.json({
       message: `Category for ${userName} changed to ${category}`,
       user
@@ -957,6 +1030,26 @@ cron.schedule("0 * * * *", async () => {
     }
   }
 }, { timezone: "Asia/Riyadh" });
+
+/**
+ * Pick a unique message for THIS appointment only.
+ * - messages: array of all messages from DB
+ * - usedMessages: array where we store which were already used
+ */
+function pickUniqueMessage(messages, usedMessages) {
+  // Filter out messages already used
+  const available = messages.filter(m => !usedMessages.includes(m.text));
+
+  // Randomly select one of the unused messages
+  const chosen = available[Math.floor(Math.random() * available.length)];
+
+  // Mark this message as used
+  usedMessages.push(chosen.text);
+
+  return chosen;
+}
+
+
 
 
 // === Start the Server ===
