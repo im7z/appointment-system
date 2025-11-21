@@ -384,6 +384,17 @@ app.post("/appointments/add", async (req, res) => {
   }
 });
 
+app.delete("/appointments/delete/:id", async (req, res) => {
+  try {
+    const deleted = await Appointment.findByIdAndDelete(req.params.id);
+    if (!deleted) {
+      return res.status(404).json({ message: "Appointment not found" });
+    }
+    res.json({ message: "Appointment deleted successfully" });
+  } catch (err) {
+    res.status(500).json({ error: "Server error" });
+  }
+});
 
 
 // === 2. Show available appointment slots ===
