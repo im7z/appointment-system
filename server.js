@@ -310,23 +310,61 @@ app.post("/appointments/add", async (req, res) => {
       return res.status(400).json({ error: "End date must be after start date." });
     }
 
-    // === Case 1️: Single Appointment ===
+    // === Case 1️: Single or Daily Single Appointment ===
     if (endHour === undefined) {
-      const date = new Date(start);
-      date.setHours(startHour, startMinute, 0, 0);
 
-      const singleSlot = new Appointment({
-        doctorName,
-        date,
-        status: "available"
-      });
+      // ⬅️ Case A: Only startDate OR startDate == endDate → add ONE slot
+      if (!endDate || endDate === startDate) {
+        const date = new Date(start);
+        date.setHours(startHour, startMinute, 0, 0);
 
-      await singleSlot.save();
+        const singleSlot = new Appointment({
+          doctorName,
+          date,
+          status: "available"
+        });
+
+        await singleSlot.save();
+        return res.json({
+          message: "Single appointment added successfully.",
+          appointment: singleSlot
+        });
+      }
+
+      // ⬅️ Case B: A date range (start → end) → add ONE slot per day
+      const getDatesInRange = (start, end) => {
+        const dates = [];
+        const current = new Date(start);
+        while (current <= end) {
+          dates.push(new Date(current));
+          current.setDate(current.getDate() + 1);
+        }
+        return dates;
+      };
+
+      const days = getDatesInRange(start, end);
+      const slots = [];
+
+      for (const day of days) {
+        const daily = new Date(day);
+        daily.setHours(startHour, startMinute, 0, 0);
+
+        slots.push({
+          doctorName,
+          date: daily,
+          status: "available"
+        });
+      }
+
+      await Appointment.insertMany(slots);
+
       return res.json({
-        message: "Single appointment added successfully.",
-        appointment: singleSlot
+        message: `${slots.length} appointments added (one per day).`,
+        totalAdded: slots.length,
+        doctorName
       });
     }
+
 
     // === Case 2️: Appointment Block ===
     const getDatesInRange = (start, end) => {
